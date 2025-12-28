@@ -1,11 +1,22 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
+    os::fd::{AsFd, AsRawFd},
+    time::{Duration, Instant, SystemTime},
+};
 
+use memfd::{Memfd, MemfdOptions};
+use mmap::{MapOption, MemoryMap};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
     protocol::{
+        wl_buffer::{self, WlBuffer},
         wl_compositor::{self, WlCompositor},
         wl_output::{self, WlOutput},
         wl_registry,
+        wl_shm::{self, WlShm},
+        wl_shm_pool::{self, WlShmPool},
         wl_surface::{self, WlSurface},
     },
 };
@@ -17,6 +28,26 @@ use wayland_protocols::ext::session_lock::v1::client::{
 };
 
 use anyhow::anyhow;
+
+fn log_line(args: std::fmt::Arguments) {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("lilac.log")
+    {
+        let _ = writeln!(file, "[{}] {}", timestamp, args);
+    }
+}
+
+macro_rules! logln {
+    ($($arg:tt)*) => {
+        log_line(format_args!($($arg)*))
+    };
+}
 
 /// This struct represents the state of our app.
 /// This type supports the `dispatch` implementations needed for the below state diagram
@@ -63,8 +94,40 @@ struct Locker {
     lock_manager: Option<ExtSessionLockManagerV1>,
     lock: Option<ExtSessionLockV1>,
     compositor: Option<WlCompositor>,
+    shared_memory: Option<WlShm>,
     monitors: HashMap<u32, Monitor>,
     state: LockState,
+    auto_unlock_deadline: Option<Instant>,
+    auto_unlock_sent: bool,
+}
+
+impl Locker {
+    fn is_initialized(&self) -> anyhow::Result<()> {
+        if self.lock_manager.is_none() {
+            return Err(anyhow!(
+                "could not find a lock manager in the registry advertisement"
+            ));
+        }
+
+        if self.compositor.is_none() {
+            return Err(anyhow!(
+                "could not find a compositor in the registry advertisement"
+            ));
+        }
+
+        if self.shared_memory.is_none() {
+            return Err(anyhow!(
+                "could not find shared memory in the registry advertisement"
+            ));
+        }
+
+        if self.monitors.is_empty() {
+            return Err(anyhow!(
+                "could not find any outputs in the registry advertisement"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -74,6 +137,7 @@ struct Monitor {
     surface: Option<WlSurface>,
     lock_surface: Option<ExtSessionLockSurfaceV1>,
     dimensions: (u32, u32),
+    buffer_state: Option<BufferState>,
 }
 
 impl Monitor {
@@ -106,10 +170,36 @@ impl Monitor {
 
         self.surface = Some(wl_surface);
         self.lock_surface = Some(lock_surface);
+
+        Ok(())
+    }
+
+    fn commit(&mut self) -> anyhow::Result<()> {
+        let buffer_state = self
+            .buffer_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("buffer state cannot be None"))?;
+
+        let buffer = &buffer_state.buffer;
+
+        let surface = self
+            .surface
+            .as_ref()
+            .ok_or_else(|| anyhow!("surface cannot be None"))?;
+
+        surface.attach(Some(buffer), 0, 0);
+        surface.damage_buffer(
+            0,
+            0,
+            self.dimensions.0.try_into()?,
+            self.dimensions.1.try_into()?,
+        );
+        surface.commit();
         Ok(())
     }
 }
 
+#[derive(PartialEq, Eq)]
 enum LockState {
     // haven’t requested a lock yet
     Idle,
@@ -124,6 +214,91 @@ enum LockState {
 impl Default for LockState {
     fn default() -> Self {
         Self::Idle
+    }
+}
+
+struct BufferState {
+    // the total number of bytes this buffer contains
+    size: i32,
+    // the length of a row
+    stride: i32,
+    // the fd for the data
+    mem_fd: Memfd,
+    // access to the actual underlying bytes
+    bytes: MemoryMap,
+    pool: WlShmPool,
+    buffer: WlBuffer,
+    // whether or not the contents of the buffer in the memory map have been sent to the compositor
+    //   - dirty = true whenever UI state changes (input, configure, timer, etc.), regardless of
+    //   buffer usage.
+    //
+    //   - successful render+commit sets dirty = false.
+    //
+    //   - if a render was desired but buffer_in_use == true, leave dirty = true and try again on
+    //   the next Release.
+    dirty: bool,
+    // whether or not the compositor is currently reading the shared memory
+    // - buffer_in_use = true right after a successful `commit()`
+    // - buffer_in_use = false on wl_buffer::Release.
+    buffer_in_use: bool,
+}
+
+impl BufferState {
+    // the flow is:
+    //  1. Create an fd (memfd or a temp file) and set_len(size).
+    //  2. mmap the fd to get a writable byte slice.
+    //  3. Pass that fd to wl_shm.create_pool(fd, size) to get a wl_shm_pool.
+    //  4. Create a wl_buffer from the pool with width/height/stride/format.
+    fn new(
+        shared_memory: &WlShm,
+        qh: &QueueHandle<Locker>,
+        name: u32,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Self> {
+        let stride = width * 4;
+        let size = stride * height;
+
+        let mem_fd_opts = MemfdOptions::default().allow_sealing(true);
+        let mem_fd = mem_fd_opts.create(name.to_string())?;
+        mem_fd.as_file().set_len(size as u64)?;
+        let c_fd = mem_fd.as_file().as_raw_fd();
+
+        let mmap_opts = vec![
+            MapOption::MapReadable,
+            MapOption::MapWritable,
+            MapOption::MapFd(c_fd),
+        ];
+
+        let bytes = MemoryMap::new(size as usize, mmap_opts.as_slice())?;
+
+        let pool = shared_memory.create_pool(mem_fd.as_file().as_fd(), size, qh, ());
+
+        let buffer =
+            pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, name);
+
+        Ok(Self {
+            size,
+            stride,
+            mem_fd,
+            bytes,
+            pool,
+            buffer,
+            buffer_in_use: false,
+            dirty: true,
+        })
+    }
+
+    fn fill_solid_color(&mut self, color: [u8; 4]) {
+        let len = self.size as usize;
+        let ptr = self.bytes.data() as *mut u8;
+        let data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+
+        for px in data.chunks_exact_mut(4) {
+            px.copy_from_slice(&color);
+        }
+
+        self.dirty = true;
     }
 }
 
@@ -158,6 +333,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Locker {
                         registry.bind::<WlCompositor, (), Locker>(name, version, qh, ());
                     state.compositor = Some(compositor);
                 }
+                "wl_shm" => {
+                    let version = version.min(WlShm::interface().version);
+                    let shared_memory = registry.bind::<WlShm, (), Locker>(name, version, qh, ());
+                    state.shared_memory = Some(shared_memory);
+                }
                 "wl_output" => {
                     let version = version.min(WlOutput::interface().version);
                     let output = registry.bind::<WlOutput, (), Locker>(name, version, qh, ());
@@ -167,7 +347,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Locker {
                 _ => return,
             }
 
-            println!("Locker found [{}] {} (v{})", name, interface, version);
+            logln!("Locker found [{}] {} (v{})", name, interface, version);
         }
     }
 }
@@ -181,7 +361,7 @@ impl Dispatch<ExtSessionLockManagerV1, ()> for Locker {
         _: &Connection,
         _: &QueueHandle<Locker>,
     ) {
-        println!(
+        logln!(
             "received an event from ExtSessionLockManager, but don't know what to do with it..."
         )
     }
@@ -208,6 +388,7 @@ impl Dispatch<ExtSessionLockV1, ()> for Locker {
             // object must be destroyed using the unlock_and_destroy request.
             ext_session_lock_v1::Event::Locked => {
                 state.state = LockState::Locked;
+                state.auto_unlock_deadline = Some(Instant::now() + Duration::from_secs(5));
             }
             // the session lock object should be destroyed
             //
@@ -234,7 +415,7 @@ impl Dispatch<ExtSessionLockV1, ()> for Locker {
             ext_session_lock_v1::Event::Finished => {
                 state.state = LockState::Finished;
             }
-            _ => println!("unknown event received from ExtSessionLock"),
+            _ => logln!("unknown event received from ExtSessionLock"),
         }
     }
 }
@@ -248,7 +429,7 @@ impl Dispatch<WlCompositor, ()> for Locker {
         _: &Connection,
         _: &QueueHandle<Locker>,
     ) {
-        println!("received an event from WlCompositor, but don't know what to do with it...")
+        logln!("received an event from WlCompositor, but don't know what to do with it...")
     }
 }
 
@@ -261,7 +442,7 @@ impl Dispatch<WlOutput, ()> for Locker {
         _: &Connection,
         _: &QueueHandle<Locker>,
     ) {
-        println!("received an event from WlCompositor, but don't know what to do with it...")
+        logln!("received an event from WlOutput, but don't know what to do with it...")
     }
 }
 
@@ -274,7 +455,59 @@ impl Dispatch<WlSurface, ()> for Locker {
         _: &Connection,
         _: &QueueHandle<Locker>,
     ) {
-        println!("received an event from WlCompositor, but don't know what to do with it...")
+        logln!("received an event from WlSurface, but don't know what to do with it...")
+    }
+}
+
+impl Dispatch<WlShm, ()> for Locker {
+    fn event(
+        _state: &mut Self,
+        _: &WlShm,
+        _: wl_shm::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Locker>,
+    ) {
+        logln!("received an event from WlShm, but don't know what to do with it...")
+    }
+}
+
+impl Dispatch<WlShmPool, ()> for Locker {
+    fn event(
+        _state: &mut Self,
+        _: &WlShmPool,
+        _: wl_shm_pool::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Locker>,
+    ) {
+        logln!("received an event from WlShmPool, but don't know what to do with it...")
+    }
+}
+
+impl Dispatch<WlBuffer, u32> for Locker {
+    fn event(
+        state: &mut Self,
+        _: &WlBuffer,
+        event: wl_buffer::Event,
+        monitor_name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Locker>,
+    ) {
+        match event {
+            wl_buffer::Event::Release => {
+                logln!("received a Release event for WlBuffer");
+                let Some(monitor) = state.monitors.get_mut(monitor_name) else {
+                    return;
+                };
+                let Some(buffer_state) = monitor.buffer_state.as_mut() else {
+                    return;
+                };
+
+                buffer_state.buffer_in_use = false;
+            }
+            _ => logln!("received an event from WlBuffer, but don't know what to do with it..."),
+        };
     }
 }
 
@@ -285,7 +518,7 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Locker {
         event: ext_session_lock_surface_v1::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<Locker>,
+        qh: &QueueHandle<Locker>,
     ) {
         match event {
             ext_session_lock_surface_v1::Event::Configure {
@@ -294,7 +527,7 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Locker {
                 serial,
             } => {
                 let event_proxy_id = proxy.id();
-                for monitor in state.monitors.values_mut() {
+                for (name, monitor) in state.monitors.iter_mut() {
                     if let Some(lock_surface) = monitor.lock_surface.as_ref() {
                         if lock_surface.id() != event_proxy_id {
                             continue;
@@ -314,11 +547,25 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Locker {
 
                         lock_surface.ack_configure(serial);
 
-                        return;
+                        let shm = &state.shared_memory.as_ref().unwrap();
+
+                        let buffer_state = BufferState::new(
+                            shm,
+                            qh,
+                            *name,
+                            final_width.try_into().unwrap(),
+                            final_height.try_into().unwrap(),
+                        )
+                        .unwrap();
+
+                        let mut buffer_state = buffer_state;
+                        let blue = 0xFF0000FFu32.to_ne_bytes();
+                        buffer_state.fill_solid_color(blue);
+                        monitor.buffer_state = Some(buffer_state);
                     }
                 }
             }
-            _ => println!("unknown event rx'd in extsessionlocksurfacev1 dispatch handler"),
+            _ => logln!("unknown event rx'd in extsessionlocksurfacev1 dispatch handler"),
         }
     }
 }
@@ -361,23 +608,7 @@ fn main() -> anyhow::Result<()> {
     // `ext_session_lock_manager_v1` interface advertisement, and bind to it.
     event_queue.roundtrip(&mut locker)?;
 
-    if locker.lock_manager.is_none() {
-        return Err(anyhow!(
-            "could not find a lock manager in the registry advertisement"
-        ));
-    }
-
-    if locker.compositor.is_none() {
-        return Err(anyhow!(
-            "could not find a compositor in the registry advertisement"
-        ));
-    }
-
-    if locker.monitors.is_empty() {
-        return Err(anyhow!(
-            "could not find any outputs in the registry advertisement"
-        ));
-    }
+    locker.is_initialized()?;
 
     // at this point, we're in a happy initial state, as we've registered all of our globals
     let lock = locker
@@ -399,6 +630,33 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         event_queue.blocking_dispatch(&mut locker)?;
+
+        for monitor in locker.monitors.values_mut() {
+            let buffer_in_use = monitor
+                .buffer_state
+                .as_ref()
+                .map(|bs| bs.buffer_in_use)
+                .unwrap_or(false);
+
+            let is_dirty = monitor
+                .buffer_state
+                .as_ref()
+                .map(|bs| bs.dirty)
+                .unwrap_or(false);
+
+            if buffer_in_use {
+                logln!("buffer was in use, will try to commit on a later event")
+            } else if !is_dirty {
+                logln!("no UI state changes to render, skipping commit")
+            } else {
+                monitor.commit()?;
+                if let Some(buffer_state) = monitor.buffer_state.as_mut() {
+                    buffer_state.buffer_in_use = true;
+                    buffer_state.dirty = false;
+                }
+            }
+        }
+
         match locker.state {
             // break out of our loop
             LockState::Finished => break,
@@ -408,9 +666,21 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             LockState::Waiting => {
-                println!("waiting on the result of calling lock...")
+                logln!("waiting on the result of calling lock...")
             }
-            LockState::Locked => {}
+            LockState::Locked => {
+                if locker.auto_unlock_sent {
+                    continue;
+                }
+                if let Some(deadline) = locker.auto_unlock_deadline {
+                    if Instant::now() >= deadline {
+                        if let Some(lock) = locker.lock.as_ref() {
+                            lock.unlock_and_destroy();
+                            locker.auto_unlock_sent = true;
+                        }
+                    }
+                }
+            }
         }
     }
 

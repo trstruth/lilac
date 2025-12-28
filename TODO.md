@@ -3,7 +3,8 @@
   - ~~Implement Dispatch<ExtSessionLockV1, ()> to handle locked/finished.~~
   - ~~For each output, create a wl_surface and call lock.get_lock_surface(...).~~
   - ~~Handle ExtSessionLockSurfaceV1::configure before the first commit.~~
-  - Render a solid color buffer to each lock surface and auto-unlock after 5 seconds as a safety check.
-    - codex resume 019b60a6-3554-7f21-bb6f-81836d0ac51c
+  - ~~Render a solid color buffer to each lock surface and auto-unlock after 5 seconds as a safety check.~~
+  - ~~Wire wl_buffer::Release to mark buffers reusable and re-render when dirty.~~
+  - ~~Add actual pixel fill into shm buffer (solid color) before committing.~~
   - Ratatui integration: build UI state + layout using a non-terminal backend (e.g. TestBackend) and render to a 2D cell buffer.
   - Ratatui integration: add a renderer that converts the cell buffer into pixels for a wl_shm buffer, then attach/commit to the lock surface.
