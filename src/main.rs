@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::OpenOptions,
-    io::Write,
+    io::{ErrorKind, Write},
     os::fd::{AsFd, AsRawFd},
     time::{Duration, Instant, SystemTime},
 };
@@ -9,6 +9,7 @@ use std::{
 use memfd::{Memfd, MemfdOptions};
 use mmap::{MapOption, MemoryMap};
 use wayland_client::{
+    backend::WaylandError,
     Connection, Dispatch, Proxy, QueueHandle,
     protocol::{
         wl_buffer::{self, WlBuffer},
@@ -199,7 +200,7 @@ impl Monitor {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Copy, Clone)]
 enum LockState {
     // haven’t requested a lock yet
     Idle,
@@ -387,6 +388,7 @@ impl Dispatch<ExtSessionLockV1, ()> for Locker {
             // If this event is sent, making the destroy request is a protocol error, the lock
             // object must be destroyed using the unlock_and_destroy request.
             ext_session_lock_v1::Event::Locked => {
+                logln!("received ext_session_lock_v1::Locked");
                 state.state = LockState::Locked;
                 state.auto_unlock_deadline = Some(Instant::now() + Duration::from_secs(5));
             }
@@ -413,6 +415,7 @@ impl Dispatch<ExtSessionLockV1, ()> for Locker {
             // the unlock_and_destroy request, depending on whether or not the locked event was
             // received on this object.
             ext_session_lock_v1::Event::Finished => {
+                logln!("received ext_session_lock_v1::Finished");
                 state.state = LockState::Finished;
             }
             _ => logln!("unknown event received from ExtSessionLock"),
@@ -562,6 +565,17 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Locker {
                         let blue = 0xFF0000FFu32.to_ne_bytes();
                         buffer_state.fill_solid_color(blue);
                         monitor.buffer_state = Some(buffer_state);
+                        match monitor.commit() {
+                            Ok(()) => {
+                                if let Some(buffer_state) = monitor.buffer_state.as_mut() {
+                                    buffer_state.buffer_in_use = true;
+                                    buffer_state.dirty = false;
+                                }
+                            }
+                            Err(err) => {
+                                logln!("commit failed after configure: {err}");
+                            }
+                        }
                     }
                 }
             }
@@ -629,7 +643,16 @@ fn main() -> anyhow::Result<()> {
     locker.state = LockState::Waiting;
 
     loop {
-        event_queue.blocking_dispatch(&mut locker)?;
+        conn.flush()?;
+        if let Some(guard) = event_queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(err)) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        let dispatched = event_queue.dispatch_pending(&mut locker)?;
 
         for monitor in locker.monitors.values_mut() {
             let buffer_in_use = monitor
@@ -665,9 +688,7 @@ fn main() -> anyhow::Result<()> {
                     "illegal state: Lock should not have been idle when entering the loop"
                 ));
             }
-            LockState::Waiting => {
-                logln!("waiting on the result of calling lock...")
-            }
+            LockState::Waiting => {}
             LockState::Locked => {
                 if locker.auto_unlock_sent {
                     continue;
@@ -680,6 +701,21 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        if dispatched == 0 {
+            let mut sleep_for = Duration::from_millis(16);
+            if let Some(deadline) = locker.auto_unlock_deadline {
+                let now = Instant::now();
+                if deadline > now {
+                    sleep_for = sleep_for.min(deadline - now);
+                } else {
+                    sleep_for = Duration::from_millis(0);
+                }
+            }
+            if sleep_for > Duration::from_millis(0) {
+                std::thread::sleep(sleep_for);
             }
         }
     }
