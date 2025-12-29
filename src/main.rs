@@ -175,13 +175,16 @@ impl Monitor {
         Ok(())
     }
 
-    fn commit(&mut self) -> anyhow::Result<()> {
+    fn commit(&mut self) -> anyhow::Result<bool> {
         let buffer_state = self
             .buffer_state
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| anyhow!("buffer state cannot be None"))?;
 
-        let buffer = &buffer_state.buffer;
+        let Some(buffer_index) = buffer_state.acquire_free_buffer_index() else {
+            return Ok(false);
+        };
+        let buffer = &buffer_state.buffers[buffer_index].buffer;
 
         let surface = self
             .surface
@@ -196,7 +199,9 @@ impl Monitor {
             self.dimensions.1.try_into()?,
         );
         surface.commit();
-        Ok(())
+        buffer_state.buffers[buffer_index].in_use = true;
+        buffer_state.dirty = false;
+        Ok(true)
     }
 }
 
@@ -218,7 +223,13 @@ impl Default for LockState {
     }
 }
 
-struct BufferState {
+#[derive(Copy, Clone)]
+struct BufferTag {
+    monitor_name: u32,
+    index: usize,
+}
+
+struct BufferSlot {
     // the total number of bytes this buffer contains
     size: i32,
     // the length of a row
@@ -229,19 +240,22 @@ struct BufferState {
     bytes: MemoryMap,
     pool: WlShmPool,
     buffer: WlBuffer,
+    // whether or not the compositor is currently reading the shared memory
+    in_use: bool,
+}
+
+struct BufferState {
+    buffers: [BufferSlot; 2],
     // whether or not the contents of the buffer in the memory map have been sent to the compositor
     //   - dirty = true whenever UI state changes (input, configure, timer, etc.), regardless of
     //   buffer usage.
     //
     //   - successful render+commit sets dirty = false.
     //
-    //   - if a render was desired but buffer_in_use == true, leave dirty = true and try again on
-    //   the next Release.
+    //   - if a render was desired but all buffers were in use, leave dirty = true and try again
+    //   on the next Release.
     dirty: bool,
-    // whether or not the compositor is currently reading the shared memory
-    // - buffer_in_use = true right after a successful `commit()`
-    // - buffer_in_use = false on wl_buffer::Release.
-    buffer_in_use: bool,
+    next_index: usize,
 }
 
 impl BufferState {
@@ -257,8 +271,48 @@ impl BufferState {
         width: i32,
         height: i32,
     ) -> anyhow::Result<Self> {
+        let buffer_0 = BufferSlot::new(shared_memory, qh, name, 0, width, height)?;
+        let buffer_1 = BufferSlot::new(shared_memory, qh, name, 1, width, height)?;
+
+        Ok(Self {
+            buffers: [buffer_0, buffer_1],
+            dirty: true,
+            next_index: 0,
+        })
+    }
+
+    fn fill_solid_color(&mut self, color: [u8; 4]) {
+        for buffer in &mut self.buffers {
+            buffer.fill_solid_color(color);
+        }
+        self.dirty = true;
+    }
+
+    fn acquire_free_buffer_index(&mut self) -> Option<usize> {
+        let total = self.buffers.len();
+        for offset in 0..total {
+            let index = (self.next_index + offset) % total;
+            if !self.buffers[index].in_use {
+                self.next_index = (index + 1) % total;
+                return Some(index);
+            }
+        }
+        None
+    }
+}
+
+impl BufferSlot {
+    fn new(
+        shared_memory: &WlShm,
+        qh: &QueueHandle<Locker>,
+        monitor_name: u32,
+        index: usize,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Self> {
         let stride = width * 4;
         let size = stride * height;
+        let name = monitor_name.wrapping_mul(2).wrapping_add(index as u32);
 
         let mem_fd_opts = MemfdOptions::default().allow_sealing(true);
         let mem_fd = mem_fd_opts.create(name.to_string())?;
@@ -269,14 +323,26 @@ impl BufferState {
             MapOption::MapReadable,
             MapOption::MapWritable,
             MapOption::MapFd(c_fd),
+            MapOption::MapNonStandardFlags(libc::MAP_SHARED),
         ];
 
         let bytes = MemoryMap::new(size as usize, mmap_opts.as_slice())?;
 
         let pool = shared_memory.create_pool(mem_fd.as_file().as_fd(), size, qh, ());
 
-        let buffer =
-            pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, name);
+        let tag = BufferTag {
+            monitor_name,
+            index,
+        };
+        let buffer = pool.create_buffer(
+            0,
+            width,
+            height,
+            stride,
+            wl_shm::Format::Argb8888,
+            qh,
+            tag,
+        );
 
         Ok(Self {
             size,
@@ -285,8 +351,7 @@ impl BufferState {
             bytes,
             pool,
             buffer,
-            buffer_in_use: false,
-            dirty: true,
+            in_use: false,
         })
     }
 
@@ -298,8 +363,6 @@ impl BufferState {
         for px in data.chunks_exact_mut(4) {
             px.copy_from_slice(&color);
         }
-
-        self.dirty = true;
     }
 }
 
@@ -488,26 +551,28 @@ impl Dispatch<WlShmPool, ()> for Locker {
     }
 }
 
-impl Dispatch<WlBuffer, u32> for Locker {
+impl Dispatch<WlBuffer, BufferTag> for Locker {
     fn event(
         state: &mut Self,
         _: &WlBuffer,
         event: wl_buffer::Event,
-        monitor_name: &u32,
+        tag: &BufferTag,
         _: &Connection,
         _: &QueueHandle<Locker>,
     ) {
         match event {
             wl_buffer::Event::Release => {
                 logln!("received a Release event for WlBuffer");
-                let Some(monitor) = state.monitors.get_mut(monitor_name) else {
+                let Some(monitor) = state.monitors.get_mut(&tag.monitor_name) else {
                     return;
                 };
                 let Some(buffer_state) = monitor.buffer_state.as_mut() else {
                     return;
                 };
 
-                buffer_state.buffer_in_use = false;
+                if tag.index < buffer_state.buffers.len() {
+                    buffer_state.buffers[tag.index].in_use = false;
+                }
             }
             _ => logln!("received an event from WlBuffer, but don't know what to do with it..."),
         };
@@ -566,11 +631,9 @@ impl Dispatch<ExtSessionLockSurfaceV1, ()> for Locker {
                         buffer_state.fill_solid_color(blue);
                         monitor.buffer_state = Some(buffer_state);
                         match monitor.commit() {
-                            Ok(()) => {
-                                if let Some(buffer_state) = monitor.buffer_state.as_mut() {
-                                    buffer_state.buffer_in_use = true;
-                                    buffer_state.dirty = false;
-                                }
+                            Ok(true) => {}
+                            Ok(false) => {
+                                logln!("all buffers were in use after configure");
                             }
                             Err(err) => {
                                 logln!("commit failed after configure: {err}");
@@ -655,27 +718,16 @@ fn main() -> anyhow::Result<()> {
         let dispatched = event_queue.dispatch_pending(&mut locker)?;
 
         for monitor in locker.monitors.values_mut() {
-            let buffer_in_use = monitor
-                .buffer_state
-                .as_ref()
-                .map(|bs| bs.buffer_in_use)
-                .unwrap_or(false);
-
             let is_dirty = monitor
                 .buffer_state
                 .as_ref()
                 .map(|bs| bs.dirty)
                 .unwrap_or(false);
 
-            if buffer_in_use {
-                logln!("buffer was in use, will try to commit on a later event")
-            } else if !is_dirty {
-                logln!("no UI state changes to render, skipping commit")
-            } else {
-                monitor.commit()?;
-                if let Some(buffer_state) = monitor.buffer_state.as_mut() {
-                    buffer_state.buffer_in_use = true;
-                    buffer_state.dirty = false;
+            if is_dirty {
+                let committed = monitor.commit()?;
+                if !committed {
+                    logln!("all buffers were in use, will try to commit on a later event")
                 }
             }
         }

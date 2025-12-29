@@ -69,6 +69,7 @@ name = "lilac"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc 0.2.178",
  "memfd",
  "mmap",
  "wayland-client",
