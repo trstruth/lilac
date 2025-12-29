@@ -6,5 +6,13 @@
   - ~~Render a solid color buffer to each lock surface and auto-unlock after 5 seconds as a safety check.~~
   - ~~Wire wl_buffer::Release to mark buffers reusable and re-render when dirty.~~
   - ~~Add actual pixel fill into shm buffer (solid color) before committing.~~
+  - ~~Use shared shm mapping and double buffering so compositors can release buffers.~~
   - Ratatui integration: build UI state + layout using a non-terminal backend (e.g. TestBackend) and render to a 2D cell buffer.
   - Ratatui integration: add a renderer that converts the cell buffer into pixels for a wl_shm buffer, then attach/commit to the lock surface.
+  - Ratatui integration design:
+    - src/tui/mod.rs: AppState, input handling, and view(frame, state) rendering.
+    - src/render/mod.rs: rasterizer that maps ratatui Buffer cells to ARGB pixels (optional background animation blend).
+    - src/main.rs: Wayland loop that drives input/ticks, calls tui render, rasterizes, and commits shm buffers.
+    - Minimal API: tui::render(state, width_cells, height_cells) -> ratatui::buffer::Buffer.
+    - Minimal API: render::rasterize(buffer, target_bytes, width_px, height_px, time_or_tick).
+    - Testing: use ratatui TestBackend in tui tests to assert cell output without Wayland.

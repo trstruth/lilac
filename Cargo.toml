@@ -2,11 +2,14 @@
 name = "lilac"
 version = "0.1.0"
 edition = "2024"
+default-run = "lilac"
 
 [dependencies]
 anyhow = "1.0.100"
+crossterm = "0.29.0"
 memfd = "0.6.5"
 libc = "0.2.177"
 mmap = "0.1.1"
 wayland-client = "0.31.11"
 wayland-protocols = { version = "0.32.9", features = ["client", "staging"] }
+ratatui = "0.30.0"
