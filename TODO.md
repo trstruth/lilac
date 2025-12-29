@@ -16,3 +16,7 @@
     - Minimal API: tui::render(state, width_cells, height_cells) -> ratatui::buffer::Buffer.
     - Minimal API: render::rasterize(buffer, target_bytes, width_px, height_px, time_or_tick).
     - Testing: use ratatui TestBackend in tui tests to assert cell output without Wayland.
+  - ~~TUI preview + login UI:~~
+    - ~~Added `src/bin/tui.rs` preview runner (Crossterm + Ratatui).~~
+    - ~~Centered login box with username/password fields and cursor placement.~~
+    - ~~Input handling for focus (Tab/Up/Down), editing, and Enter submit routing via `AppAction::Submit`.~~
